@@ -147,6 +147,20 @@ adb-agent keyevent HOME
 adb-agent text "hello world"
 ```
 
+Accessibility/UI hierarchy:
+
+```bash
+adb-agent ui tree --output json
+adb-agent ui find "Settings" --output json
+adb-agent ui dump --local window_dump.xml --output json
+```
+
+`ui` commands use Android `uiautomator dump` to collect accessibility hierarchy
+metadata. This gives agents indirect screen context such as text,
+`content-desc`, `resource-id`, class, package, bounds, clickable/enabled/focused
+state, and scrollability. It is a reference layer for deciding where to tap or
+what to verify; screenshot remains useful for visual confirmation.
+
 Shell and raw adb:
 
 ```bash

@@ -178,6 +178,11 @@ enum Commands {
         #[command(subcommand)]
         command: AppCommand,
     },
+    /// Inspect Android UI accessibility hierarchy with uiautomator.
+    Ui {
+        #[command(subcommand)]
+        command: UiCommand,
+    },
     /// Pass raw arguments to adb. Uses the session device unless --no-device is set.
     Raw {
         #[arg(long)]
@@ -243,6 +248,43 @@ enum AppCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum UiCommand {
+    /// Dump current UI hierarchy XML and return parsed node summary.
+    Dump {
+        /// Use uiautomator compressed hierarchy.
+        #[arg(long)]
+        compressed: bool,
+        /// Remote XML path on device.
+        #[arg(long, default_value = "/sdcard/window_dump.xml")]
+        remote: String,
+        /// Also save XML to a local file.
+        #[arg(long)]
+        local: Option<PathBuf>,
+        /// Keep the remote XML file on device.
+        #[arg(long)]
+        keep_remote: bool,
+        /// Maximum nodes included in JSON summary.
+        #[arg(long, default_value_t = 200)]
+        max_nodes: usize,
+    },
+    /// Return only parsed UI nodes as JSON/text summary.
+    Tree {
+        #[arg(long)]
+        compressed: bool,
+        #[arg(long, default_value_t = 200)]
+        max_nodes: usize,
+    },
+    /// Search visible UI nodes by text, content-desc, resource-id, or class.
+    Find {
+        query: String,
+        #[arg(long)]
+        compressed: bool,
+        #[arg(long, default_value_t = 50)]
+        max_results: usize,
+    },
+}
+
 #[derive(Clone, Debug, ValueEnum)]
 enum FindKind {
     Any,
@@ -296,6 +338,29 @@ struct RecoverReport {
     reconnected_tcp: bool,
     before: Vec<DeviceInfo>,
     after: Vec<DeviceInfo>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UiNode {
+    index: usize,
+    depth: usize,
+    text: String,
+    content_desc: String,
+    resource_id: String,
+    class: String,
+    package: String,
+    bounds: String,
+    clickable: bool,
+    enabled: bool,
+    focused: bool,
+    selected: bool,
+    scrollable: bool,
+}
+
+#[derive(Debug)]
+struct UiDump {
+    xml: String,
+    nodes: Vec<UiNode>,
 }
 
 #[derive(Debug)]
@@ -674,6 +739,7 @@ fn dispatch(app: &App, command: Commands) -> Result<Response> {
             ))
         }
         Commands::App { command } => handle_app(app, command),
+        Commands::Ui { command } => handle_ui(app, command),
         Commands::Raw { no_device, args } => {
             let device = if no_device { None } else { app.device().ok() };
             let output = if let Some(device) = &device {
@@ -809,6 +875,238 @@ fn normalize_activity_component(package: &str, activity: &str) -> String {
     } else {
         format!("{package}/{activity}")
     }
+}
+
+fn handle_ui(app: &App, command: UiCommand) -> Result<Response> {
+    match command {
+        UiCommand::Dump {
+            compressed,
+            remote,
+            local,
+            keep_remote,
+            max_nodes,
+        } => {
+            let device = app.device()?;
+            let dump = dump_ui(app, &device, compressed, &remote, keep_remote)?;
+            if let Some(local) = &local {
+                if let Some(parent) = local
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                fs::write(local, &dump.xml)
+                    .with_context(|| format!("failed to write {}", local.display()))?;
+            }
+            let nodes = limit_ui_nodes(&dump.nodes, max_nodes);
+            Ok(Response {
+                ok: true,
+                action: "ui.dump".to_string(),
+                device: Some(device),
+                exit_code: Some(0),
+                stdout: format!("dumped {} ui nodes\n", dump.nodes.len()),
+                stderr: String::new(),
+                data: json!({
+                    "compressed": compressed,
+                    "remote": remote,
+                    "local": local,
+                    "node_count": dump.nodes.len(),
+                    "returned_node_count": nodes.len(),
+                    "nodes": nodes,
+                    "xml": dump.xml,
+                }),
+                error: None,
+            })
+        }
+        UiCommand::Tree {
+            compressed,
+            max_nodes,
+        } => {
+            let device = app.device()?;
+            let dump = dump_ui(app, &device, compressed, "/sdcard/window_dump.xml", false)?;
+            let nodes = limit_ui_nodes(&dump.nodes, max_nodes);
+            Ok(Response {
+                ok: true,
+                action: "ui.tree".to_string(),
+                device: Some(device),
+                exit_code: Some(0),
+                stdout: format_ui_nodes(&nodes),
+                stderr: String::new(),
+                data: json!({
+                    "compressed": compressed,
+                    "node_count": dump.nodes.len(),
+                    "returned_node_count": nodes.len(),
+                    "nodes": nodes,
+                }),
+                error: None,
+            })
+        }
+        UiCommand::Find {
+            query,
+            compressed,
+            max_results,
+        } => {
+            let device = app.device()?;
+            let dump = dump_ui(app, &device, compressed, "/sdcard/window_dump.xml", false)?;
+            let query_lower = query.to_ascii_lowercase();
+            let matches: Vec<UiNode> = dump
+                .nodes
+                .iter()
+                .filter(|node| ui_node_matches(node, &query_lower))
+                .take(max_results)
+                .cloned()
+                .collect();
+            Ok(Response {
+                ok: true,
+                action: "ui.find".to_string(),
+                device: Some(device),
+                exit_code: Some(0),
+                stdout: format_ui_nodes(&matches),
+                stderr: String::new(),
+                data: json!({
+                    "compressed": compressed,
+                    "query": query,
+                    "node_count": dump.nodes.len(),
+                    "returned_node_count": matches.len(),
+                    "nodes": matches,
+                }),
+                error: None,
+            })
+        }
+    }
+}
+
+fn dump_ui(
+    app: &App,
+    device: &str,
+    compressed: bool,
+    remote: &str,
+    keep_remote: bool,
+) -> Result<UiDump> {
+    let mut dump_args = vec![
+        "shell".to_string(),
+        "uiautomator".to_string(),
+        "dump".to_string(),
+    ];
+    if compressed {
+        dump_args.push("--compressed".to_string());
+    }
+    dump_args.push(remote.to_string());
+    let dump_output = app.adb(true, [device], dump_args)?;
+    if dump_output.exit_code != Some(0) {
+        bail!(
+            "uiautomator dump failed: {}",
+            if dump_output.stderr.trim().is_empty() {
+                dump_output.stdout.trim()
+            } else {
+                dump_output.stderr.trim()
+            }
+        );
+    }
+
+    let cat_output = app.adb(true, [device], ["exec-out", "cat", remote])?;
+    if !keep_remote {
+        let _ = app.adb(true, [device], ["shell", "rm", "-f", remote]);
+    }
+    if cat_output.exit_code != Some(0) {
+        bail!(
+            "failed to read UI dump: {}",
+            if cat_output.stderr.trim().is_empty() {
+                cat_output.stdout.trim()
+            } else {
+                cat_output.stderr.trim()
+            }
+        );
+    }
+
+    let xml = cat_output.stdout;
+    let nodes = parse_ui_nodes(&xml)?;
+    Ok(UiDump { xml, nodes })
+}
+
+fn parse_ui_nodes(xml: &str) -> Result<Vec<UiNode>> {
+    let doc = roxmltree::Document::parse(xml).context("failed to parse uiautomator XML")?;
+    let mut nodes = Vec::new();
+    for node in doc.descendants().filter(|node| node.has_tag_name("node")) {
+        nodes.push(UiNode {
+            index: nodes.len(),
+            depth: node
+                .ancestors()
+                .filter(|ancestor| ancestor.has_tag_name("node"))
+                .count(),
+            text: attr(&node, "text"),
+            content_desc: attr(&node, "content-desc"),
+            resource_id: attr(&node, "resource-id"),
+            class: attr(&node, "class"),
+            package: attr(&node, "package"),
+            bounds: attr(&node, "bounds"),
+            clickable: attr_bool(&node, "clickable"),
+            enabled: attr_bool(&node, "enabled"),
+            focused: attr_bool(&node, "focused"),
+            selected: attr_bool(&node, "selected"),
+            scrollable: attr_bool(&node, "scrollable"),
+        });
+    }
+    Ok(nodes)
+}
+
+fn attr(node: &roxmltree::Node<'_, '_>, name: &str) -> String {
+    node.attribute(name).unwrap_or_default().to_string()
+}
+
+fn attr_bool(node: &roxmltree::Node<'_, '_>, name: &str) -> bool {
+    node.attribute(name) == Some("true")
+}
+
+fn limit_ui_nodes(nodes: &[UiNode], max_nodes: usize) -> Vec<UiNode> {
+    if max_nodes == 0 {
+        nodes.to_vec()
+    } else {
+        nodes.iter().take(max_nodes).cloned().collect()
+    }
+}
+
+fn ui_node_matches(node: &UiNode, query_lower: &str) -> bool {
+    [
+        node.text.as_str(),
+        node.content_desc.as_str(),
+        node.resource_id.as_str(),
+        node.class.as_str(),
+        node.package.as_str(),
+    ]
+    .iter()
+    .any(|value| value.to_ascii_lowercase().contains(query_lower))
+}
+
+fn format_ui_nodes(nodes: &[UiNode]) -> String {
+    if nodes.is_empty() {
+        return "no matching ui nodes\n".to_string();
+    }
+    nodes
+        .iter()
+        .map(|node| {
+            let label = first_non_empty(&[
+                node.text.as_str(),
+                node.content_desc.as_str(),
+                node.resource_id.as_str(),
+                node.class.as_str(),
+            ]);
+            format!(
+                "#{:<3} depth={} bounds={} clickable={} enabled={} {}\n",
+                node.index, node.depth, node.bounds, node.clickable, node.enabled, label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn first_non_empty<'a>(values: &[&'a str]) -> &'a str {
+    values
+        .iter()
+        .copied()
+        .find(|value| !value.is_empty())
+        .unwrap_or("")
 }
 
 fn handle_recover(app: &App, force: bool, wait_ms: u64) -> Result<Response> {
@@ -1592,5 +1890,24 @@ emulator-5554 device product:sdk_gphone64 model:sdk_gphone64 transport_id:1
         };
 
         assert!(!is_recoverable_adb_error(&output));
+    }
+
+    #[test]
+    fn parses_uiautomator_nodes() {
+        let xml = r#"
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.example" content-desc="" clickable="false" enabled="true" focused="false" selected="false" scrollable="false" bounds="[0,0][1080,2340]">
+    <node index="1" text="Settings" resource-id="android:id/title" class="android.widget.TextView" package="com.example" content-desc="Settings title" clickable="true" enabled="true" focused="false" selected="false" scrollable="false" bounds="[10,20][300,80]" />
+  </node>
+</hierarchy>
+"#;
+
+        let nodes = parse_ui_nodes(xml).unwrap();
+
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[1].text, "Settings");
+        assert_eq!(nodes[1].content_desc, "Settings title");
+        assert!(nodes[1].clickable);
+        assert!(ui_node_matches(&nodes[1], "settings"));
     }
 }
