@@ -1,10 +1,12 @@
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, File},
     io::{self, Write},
     path::PathBuf,
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,6 +29,14 @@ struct Cli {
     /// Override the current session device for this command.
     #[arg(short = 's', long, global = true)]
     device: Option<String>,
+
+    /// Use a named device session. Defaults to the selected current session.
+    #[arg(long, global = true)]
+    session: Option<String>,
+
+    /// Restart adb server and retry once when a device command sees missing/offline device errors.
+    #[arg(long, global = true)]
+    auto_recover: bool,
 
     /// Output format. JSON is stable for agents.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
@@ -59,6 +69,15 @@ enum Commands {
     StartServer,
     /// Kill adb server.
     KillServer,
+    /// Restart adb server when devices disappear or go offline, then list devices again.
+    Recover {
+        /// Force restart even if the selected device currently appears healthy.
+        #[arg(long)]
+        force: bool,
+        /// Milliseconds to wait after killing adb server before starting it again.
+        #[arg(long, default_value_t = 700)]
+        wait_ms: u64,
+    },
     /// Manage the current device session.
     Session {
         #[command(subcommand)]
@@ -170,11 +189,29 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum SessionCommand {
-    /// Set current session device.
-    Use { device: String },
-    /// Show current session device and state file path.
-    Show,
-    /// Clear current session.
+    /// Set a named session device and select it unless --no-select is set.
+    Use {
+        device: String,
+        /// Session name.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Save the session without selecting it as current.
+        #[arg(long)]
+        no_select: bool,
+    },
+    /// Select an existing named session as current.
+    Select { name: String },
+    /// List all named sessions.
+    List,
+    /// Show selected or named session.
+    Show {
+        /// Session name. Defaults to selected current session.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove a named session.
+    Remove { name: String },
+    /// Clear the selected current session pointer.
     Clear,
     /// Print session state file path.
     Path,
@@ -226,6 +263,12 @@ struct SessionState {
     updated_at_unix: u64,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SessionStore {
+    current: Option<String>,
+    sessions: BTreeMap<String, SessionState>,
+}
+
 #[derive(Debug, Serialize)]
 struct ScreenshotResult {
     path: PathBuf,
@@ -239,11 +282,20 @@ struct ScreenshotResult {
     file_bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct DeviceInfo {
     serial: String,
     state: String,
     details: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoverReport {
+    expected_device: Option<String>,
+    restarted_server: bool,
+    reconnected_tcp: bool,
+    before: Vec<DeviceInfo>,
+    after: Vec<DeviceInfo>,
 }
 
 #[derive(Debug)]
@@ -268,6 +320,8 @@ struct Response {
 struct App {
     adb: String,
     cli_device: Option<String>,
+    cli_session: Option<String>,
+    auto_recover: bool,
     format: OutputFormat,
 }
 
@@ -276,6 +330,8 @@ fn main() {
     let app = App {
         adb: cli.adb,
         cli_device: cli.device,
+        cli_session: cli.session,
+        auto_recover: cli.auto_recover,
         format: cli.output,
     };
 
@@ -284,10 +340,7 @@ fn main() {
         Err(error) => Response {
             ok: false,
             action: "error".to_string(),
-            device: app
-                .cli_device
-                .clone()
-                .or_else(|| read_session().ok().map(|s| s.device)),
+            device: app.cli_device.clone().or_else(|| app.session_device().ok()),
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
@@ -319,7 +372,16 @@ fn dispatch(app: &App, command: Commands) -> Result<Response> {
         Commands::Connect { target, select } => {
             let output = app.adb(false, Vec::<String>::new(), ["connect", target.as_str()])?;
             if select && output.exit_code == Some(0) {
-                write_session(&target)?;
+                let mut store = read_session_store().unwrap_or_default();
+                store.sessions.insert(
+                    "default".to_string(),
+                    SessionState {
+                        device: target.clone(),
+                        updated_at_unix: unix_now(),
+                    },
+                );
+                store.current = Some("default".to_string());
+                write_session_store(&store)?;
             }
             Ok(response_from_output(
                 "connect",
@@ -349,6 +411,7 @@ fn dispatch(app: &App, command: Commands) -> Result<Response> {
             let output = app.adb(false, Vec::<String>::new(), ["kill-server"])?;
             Ok(response_from_output("kill-server", None, output, json!({})))
         }
+        Commands::Recover { force, wait_ms } => handle_recover(app, force, wait_ms),
         Commands::Session { command } => handle_session(command),
         Commands::Ls { path } => {
             let device = app.device()?;
@@ -748,16 +811,161 @@ fn normalize_activity_component(package: &str, activity: &str) -> String {
     }
 }
 
+fn handle_recover(app: &App, force: bool, wait_ms: u64) -> Result<Response> {
+    let expected_device = app.cli_device.clone().or_else(|| app.session_device().ok());
+    let report = recover_adb_server(app, expected_device.as_deref(), force, wait_ms)?;
+    let auth_hint = authorization_hint(expected_device.as_deref(), &report.after)
+        .or_else(|| authorization_hint(expected_device.as_deref(), &report.before));
+    let healthy =
+        auth_hint.is_none() && is_device_healthy(expected_device.as_deref(), &report.after);
+
+    let stdout = format_devices(&report.after);
+    Ok(Response {
+        ok: healthy,
+        action: "recover".to_string(),
+        device: expected_device.clone(),
+        exit_code: Some(if healthy { 0 } else { 1 }),
+        stdout,
+        stderr: String::new(),
+        data: json!({ "recover": report, "authorization_hint": auth_hint }),
+        error: if healthy {
+            None
+        } else {
+            Some(auth_hint.unwrap_or_else(|| {
+                "selected device is still missing or offline after adb server restart".to_string()
+            }))
+        },
+    })
+}
+
+fn recover_adb_server(
+    app: &App,
+    expected_device: Option<&str>,
+    force: bool,
+    wait_ms: u64,
+) -> Result<RecoverReport> {
+    let before = adb_devices(app).unwrap_or_default();
+    if !force
+        && authorization_hint(expected_device, &before).is_none()
+        && is_device_healthy(expected_device, &before)
+    {
+        return Ok(RecoverReport {
+            expected_device: expected_device.map(ToString::to_string),
+            restarted_server: false,
+            reconnected_tcp: false,
+            before: before.clone(),
+            after: before,
+        });
+    }
+
+    app.run_adb(None, &["kill-server".to_string()])?;
+    thread::sleep(Duration::from_millis(wait_ms));
+    app.run_adb(None, &["start-server".to_string()])?;
+
+    let mut reconnected_tcp = false;
+    if let Some(device) = expected_device.filter(|device| device.contains(':')) {
+        app.run_adb(None, &["connect".to_string(), device.to_string()])?;
+        reconnected_tcp = true;
+    }
+
+    let after = adb_devices(app).unwrap_or_default();
+    Ok(RecoverReport {
+        expected_device: expected_device.map(ToString::to_string),
+        restarted_server: true,
+        reconnected_tcp,
+        before,
+        after,
+    })
+}
+
+fn adb_devices(app: &App) -> Result<Vec<DeviceInfo>> {
+    let output = app.run_adb(None, &["devices".to_string(), "-l".to_string()])?;
+    Ok(parse_devices(&output.stdout))
+}
+
+fn is_device_healthy(expected_device: Option<&str>, devices: &[DeviceInfo]) -> bool {
+    match expected_device {
+        Some(expected) => devices
+            .iter()
+            .any(|device| device.serial == expected && device.state == "device"),
+        None => devices.iter().any(|device| device.state == "device"),
+    }
+}
+
+fn authorization_hint(expected_device: Option<&str>, devices: &[DeviceInfo]) -> Option<String> {
+    let unauthorized = devices.iter().find(|device| {
+        device.state == "unauthorized"
+            && expected_device
+                .map(|expected| expected == device.serial)
+                .unwrap_or(true)
+    })?;
+    Some(format!(
+        "device `{}` is unauthorized; unlock the phone and accept the USB debugging RSA authorization prompt, then run `adb-agent recover` again",
+        unauthorized.serial
+    ))
+}
+
+fn is_recoverable_adb_error(output: &AdbOutput) -> bool {
+    let text = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    if text.contains("unauthorized") {
+        return false;
+    }
+    text.contains("offline")
+        || text.contains("not found")
+        || text.contains("no devices/emulators found")
+        || text.contains("device disconnected")
+        || text.contains("failed to get feature set")
+}
+
+fn format_devices(devices: &[DeviceInfo]) -> String {
+    if devices.is_empty() {
+        return "no devices\n".to_string();
+    }
+    devices
+        .iter()
+        .map(|device| {
+            if device.details.is_empty() {
+                format!("{}\t{}\n", device.serial, device.state)
+            } else {
+                format!(
+                    "{}\t{}\t{}\n",
+                    device.serial,
+                    device.state,
+                    device.details.join(" ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 impl App {
     fn device(&self) -> Result<String> {
         self.cli_device
             .clone()
-            .or_else(|| read_session().ok().map(|session| session.device))
+            .or_else(|| self.session_device().ok())
             .ok_or_else(|| {
                 anyhow!(
-                    "no device selected; pass --device <serial> or run `agent-adb-control session use <serial>`"
+                    "no device selected; pass --device <serial>, --session <name>, or run `adb-agent session use <serial> --name <name>`"
                 )
             })
+    }
+
+    fn session_device(&self) -> Result<String> {
+        let store = read_session_store()?;
+        let requested = self.session_name_override();
+        let name = selected_session_name(&store, requested.as_deref())?;
+        store
+            .sessions
+            .get(&name)
+            .map(|session| session.device.clone())
+            .ok_or_else(|| anyhow!("session `{name}` does not exist"))
+    }
+
+    fn session_name_override(&self) -> Option<String> {
+        self.cli_session
+            .clone()
+            .or_else(|| env::var("AGENT_ADB_CONTROL_SESSION").ok())
     }
 
     fn adb<D, A, S>(&self, use_device: bool, device: D, args: A) -> Result<AdbOutput>
@@ -767,8 +975,7 @@ impl App {
         A: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut command = Command::new(&self.adb);
-        if use_device {
+        let device_arg = if use_device {
             let device_args: Vec<String> = device
                 .into_iter()
                 .map(|part| part.as_ref().to_string())
@@ -776,10 +983,36 @@ impl App {
             if device_args.is_empty() {
                 bail!("internal error: adb command requested device mode without a device");
             }
-            command.arg("-s").arg(&device_args[0]);
+            Some(device_args[0].clone())
+        } else {
+            None
+        };
+
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string())
+            .collect();
+        let output = self.run_adb(device_arg.as_deref(), &args)?;
+
+        if self.auto_recover
+            && use_device
+            && output.exit_code != Some(0)
+            && is_recoverable_adb_error(&output)
+        {
+            recover_adb_server(self, device_arg.as_deref(), true, 700)?;
+            return self.run_adb(device_arg.as_deref(), &args);
+        }
+
+        Ok(output)
+    }
+
+    fn run_adb(&self, device: Option<&str>, args: &[String]) -> Result<AdbOutput> {
+        let mut command = Command::new(&self.adb);
+        if let Some(device) = device {
+            command.arg("-s").arg(device);
         }
         for arg in args {
-            command.arg(arg.as_ref());
+            command.arg(arg);
         }
         let output = command
             .output()
@@ -794,58 +1027,152 @@ impl App {
 
 fn handle_session(command: SessionCommand) -> Result<Response> {
     match command {
-        SessionCommand::Use { device } => {
-            write_session(&device)?;
+        SessionCommand::Use {
+            device,
+            name,
+            no_select,
+        } => {
+            let mut store = read_session_store().unwrap_or_default();
+            store.sessions.insert(
+                name.clone(),
+                SessionState {
+                    device: device.clone(),
+                    updated_at_unix: unix_now(),
+                },
+            );
+            if !no_select {
+                store.current = Some(name.clone());
+            }
+            write_session_store(&store)?;
             Ok(Response {
                 ok: true,
                 action: "session.use".to_string(),
                 device: Some(device.clone()),
                 exit_code: Some(0),
-                stdout: format!("current device: {device}\n"),
+                stdout: if no_select {
+                    format!("session {name}: {device}\n")
+                } else {
+                    format!("current session {name}: {device}\n")
+                },
                 stderr: String::new(),
-                data: json!({ "device": device, "path": session_path()? }),
+                data: json!({ "name": name, "device": device, "selected": !no_select, "path": session_path()? }),
                 error: None,
             })
         }
-        SessionCommand::Show => {
+        SessionCommand::Select { name } => {
+            let mut store = read_session_store()?;
+            let session = store
+                .sessions
+                .get(&name)
+                .ok_or_else(|| anyhow!("session `{name}` does not exist"))?;
+            let device = session.device.clone();
+            store.current = Some(name.clone());
+            write_session_store(&store)?;
+            Ok(Response {
+                ok: true,
+                action: "session.select".to_string(),
+                device: Some(device.clone()),
+                exit_code: Some(0),
+                stdout: format!("current session: {name}\n"),
+                stderr: String::new(),
+                data: json!({ "name": name, "device": device, "path": session_path()? }),
+                error: None,
+            })
+        }
+        SessionCommand::List => {
+            let store = read_session_store().unwrap_or_default();
+            let stdout = if store.sessions.is_empty() {
+                "no sessions\n".to_string()
+            } else {
+                store
+                    .sessions
+                    .iter()
+                    .map(|(name, session)| {
+                        let marker = if store.current.as_deref() == Some(name.as_str()) {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        format!("{marker} {name}: {}\n", session.device)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            Ok(Response {
+                ok: true,
+                action: "session.list".to_string(),
+                device: None,
+                exit_code: Some(0),
+                stdout,
+                stderr: String::new(),
+                data: json!({ "current": store.current, "sessions": store.sessions, "path": session_path()? }),
+                error: None,
+            })
+        }
+        SessionCommand::Show { name } => {
             let path = session_path()?;
-            match read_session() {
-                Ok(session) => Ok(Response {
+            let store = read_session_store().unwrap_or_default();
+            let selected = selected_session_name(&store, name.as_deref()).ok();
+            let session = selected
+                .as_ref()
+                .and_then(|name| store.sessions.get(name).map(|session| (name, session)));
+            match session {
+                Some((name, session)) => Ok(Response {
                     ok: true,
                     action: "session.show".to_string(),
                     device: Some(session.device.clone()),
                     exit_code: Some(0),
-                    stdout: format!("current device: {}\n", session.device),
+                    stdout: format!("session {name}: {}\n", session.device),
                     stderr: String::new(),
-                    data: json!({ "session": session, "path": path }),
+                    data: json!({ "name": name, "session": session, "current": store.current, "path": path }),
                     error: None,
                 }),
-                Err(_) => Ok(Response {
+                None => Ok(Response {
                     ok: true,
                     action: "session.show".to_string(),
                     device: None,
                     exit_code: Some(0),
-                    stdout: "no current device\n".to_string(),
+                    stdout: "no selected session\n".to_string(),
                     stderr: String::new(),
-                    data: json!({ "session": null, "path": path }),
+                    data: json!({ "name": selected, "session": null, "current": store.current, "path": path }),
                     error: None,
                 }),
             }
         }
-        SessionCommand::Clear => {
-            let path = session_path()?;
-            if path.exists() {
-                fs::remove_file(&path)
-                    .with_context(|| format!("failed to remove {}", path.display()))?;
+        SessionCommand::Remove { name } => {
+            let mut store = read_session_store()?;
+            let removed = store.sessions.remove(&name);
+            if store.current.as_deref() == Some(name.as_str()) {
+                store.current = None;
             }
+            write_session_store(&store)?;
+            Ok(Response {
+                ok: true,
+                action: "session.remove".to_string(),
+                device: removed.as_ref().map(|session| session.device.clone()),
+                exit_code: Some(0),
+                stdout: if removed.is_some() {
+                    format!("removed session {name}\n")
+                } else {
+                    format!("session {name} did not exist\n")
+                },
+                stderr: String::new(),
+                data: json!({ "name": name, "removed": removed.is_some(), "path": session_path()? }),
+                error: None,
+            })
+        }
+        SessionCommand::Clear => {
+            let mut store = read_session_store().unwrap_or_default();
+            store.current = None;
+            write_session_store(&store)?;
             Ok(Response {
                 ok: true,
                 action: "session.clear".to_string(),
                 device: None,
                 exit_code: Some(0),
-                stdout: "session cleared\n".to_string(),
+                stdout: "current session cleared\n".to_string(),
                 stderr: String::new(),
-                data: json!({ "path": path }),
+                data: json!({ "path": session_path()? }),
                 error: None,
             })
         }
@@ -873,6 +1200,7 @@ fn response_from_output(
 ) -> Response {
     let ok = output.exit_code == Some(0);
     let stderr = output.stderr;
+    let combined = format!("{}\n{}", output.stdout, stderr);
     Response {
         ok,
         action: action.into(),
@@ -881,6 +1209,11 @@ fn response_from_output(
         stdout: output.stdout,
         error: if ok {
             None
+        } else if combined.to_ascii_lowercase().contains("unauthorized") {
+            Some(
+                "device is unauthorized; unlock the phone and accept the USB debugging RSA authorization prompt"
+                    .to_string(),
+            )
         } else {
             Some(if stderr.trim().is_empty() {
                 "adb command failed".to_string()
@@ -1058,26 +1391,52 @@ fn default_screenshot_path(format: ScreenshotFormat) -> PathBuf {
     PathBuf::from(format!("screenshot-{}.{}", unix_now(), extension))
 }
 
-fn read_session() -> Result<SessionState> {
+fn read_session_store() -> Result<SessionStore> {
     let path = session_path()?;
     let content =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&content)
-        .with_context(|| format!("invalid session file {}", path.display()))
+    let value: Value = serde_json::from_str(&content)
+        .with_context(|| format!("invalid session file {}", path.display()))?;
+
+    if value.get("sessions").is_some() {
+        serde_json::from_value(value)
+            .with_context(|| format!("invalid session file {}", path.display()))
+    } else {
+        let legacy: SessionState = serde_json::from_value(value)
+            .with_context(|| format!("invalid legacy session file {}", path.display()))?;
+        let mut sessions = BTreeMap::new();
+        sessions.insert("default".to_string(), legacy);
+        Ok(SessionStore {
+            current: Some("default".to_string()),
+            sessions,
+        })
+    }
 }
 
-fn write_session(device: &str) -> Result<()> {
+fn write_session_store(store: &SessionStore) -> Result<()> {
     let path = session_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let state = SessionState {
-        device: device.to_string(),
-        updated_at_unix: unix_now(),
-    };
-    let content = serde_json::to_string_pretty(&state)?;
+    let content = serde_json::to_string_pretty(store)?;
     fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn selected_session_name(store: &SessionStore, requested: Option<&str>) -> Result<String> {
+    if let Some(name) = requested {
+        return Ok(name.to_string());
+    }
+    if let Some(name) = &store.current {
+        return Ok(name.clone());
+    }
+    if store.sessions.len() == 1 {
+        return Ok(store.sessions.keys().next().expect("one session").clone());
+    }
+    if store.sessions.contains_key("default") {
+        return Ok("default".to_string());
+    }
+    bail!("no session selected; run `adb-agent session select <name>` or pass `--session <name>`")
 }
 
 fn session_path() -> Result<PathBuf> {
@@ -1181,5 +1540,57 @@ emulator-5554 device product:sdk_gphone64 model:sdk_gphone64 transport_id:1
                 "1"
             ]
         );
+    }
+
+    #[test]
+    fn selected_session_prefers_requested_then_current() {
+        let mut store = SessionStore::default();
+        store.sessions.insert(
+            "phone-a".to_string(),
+            SessionState {
+                device: "device-a".to_string(),
+                updated_at_unix: 1,
+            },
+        );
+        store.sessions.insert(
+            "phone-b".to_string(),
+            SessionState {
+                device: "device-b".to_string(),
+                updated_at_unix: 2,
+            },
+        );
+        store.current = Some("phone-a".to_string());
+
+        assert_eq!(
+            selected_session_name(&store, Some("phone-b")).unwrap(),
+            "phone-b"
+        );
+        assert_eq!(selected_session_name(&store, None).unwrap(), "phone-a");
+    }
+
+    #[test]
+    fn authorization_hint_points_user_to_phone_prompt() {
+        let devices = vec![DeviceInfo {
+            serial: "R5CX3058KHP".to_string(),
+            state: "unauthorized".to_string(),
+            details: vec![],
+        }];
+
+        let hint = authorization_hint(Some("R5CX3058KHP"), &devices).unwrap();
+
+        assert!(hint.contains("unauthorized"));
+        assert!(hint.contains("unlock the phone"));
+        assert!(!is_device_healthy(Some("R5CX3058KHP"), &devices));
+    }
+
+    #[test]
+    fn unauthorized_errors_are_not_auto_recoverable() {
+        let output = AdbOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "error: device unauthorized".to_string(),
+        };
+
+        assert!(!is_recoverable_adb_error(&output));
     }
 }

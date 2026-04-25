@@ -35,7 +35,7 @@ adb-agent devices --output json
 Use a USB device or emulator for the current session:
 
 ```bash
-adb-agent session use emulator-5554
+adb-agent session use emulator-5554 --name default
 ```
 
 Connect to a TCP/IP device and select it as the current session:
@@ -48,6 +48,7 @@ Show or clear the session:
 
 ```bash
 adb-agent session show
+adb-agent session list
 adb-agent session clear
 ```
 
@@ -57,12 +58,48 @@ Override the session for one command:
 adb-agent --device emulator-5554 shell getprop ro.product.model
 ```
 
+Use named sessions for multiple devices or multiple agents:
+
+```bash
+adb-agent session use R5CX3058KHP --name phone-a
+adb-agent session use 192.168.1.25:5555 --name phone-b --no-select
+adb-agent --session phone-a screenshot phone-a.jpg
+adb-agent --session phone-b shell wm size
+adb-agent session select phone-a
+adb-agent session remove phone-b
+```
+
+Each agent should pass its own `--session <name>` to avoid overwriting another
+agent's selected current session.
+
+Agents can also set `AGENT_ADB_CONTROL_SESSION=<name>` and omit `--session` from
+each command.
+
 Session state is stored at:
 
 - Windows: `%APPDATA%\agent-adb-control\session.json`
 - macOS/Linux: `~/.agent-adb-control/session.json`
 
 Set `AGENT_ADB_CONTROL_HOME` to override the state directory.
+
+## Device Recovery
+
+Recover missing, offline, or unstable devices:
+
+```bash
+adb-agent recover
+adb-agent --session phone-a recover
+adb-agent --session phone-a --auto-recover shell wm size
+adb-agent --device R5CX3058KHP recover --force
+```
+
+`recover` checks `adb devices -l`, restarts the adb server when the selected
+device is missing or offline, reconnects TCP/IP devices when the selected serial
+looks like `host:port`, then lists devices again.
+
+If a device is `unauthorized`, the CLI does not treat that as a server restart
+problem. It returns a prompt telling the user to unlock the phone and accept the
+USB debugging RSA authorization dialog.
 
 ## Common Commands
 
