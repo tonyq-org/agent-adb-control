@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use image::{GenericImageView, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
+use image::{GenericImageView, ImageFormat, Rgba, codecs::jpeg::JpegEncoder, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -283,6 +283,32 @@ enum UiCommand {
         #[arg(long, default_value_t = 50)]
         max_results: usize,
     },
+    /// Predict which UI node a tap coordinate would hit and save a red-dot preview.
+    Hit {
+        x: i32,
+        y: i32,
+        /// Coordinate space for x/y.
+        #[arg(long, value_enum, default_value_t = CoordSpace::Device)]
+        coords: CoordSpace,
+        /// Annotated screenshot output path.
+        #[arg(long)]
+        annotated: Option<PathBuf>,
+        /// Use uiautomator compressed hierarchy.
+        #[arg(long)]
+        compressed: bool,
+        /// Maximum preview width.
+        #[arg(long, default_value_t = 1080, value_parser = clap::value_parser!(u32).range(1..))]
+        max_width: u32,
+        /// Maximum preview height.
+        #[arg(long, default_value_t = 1080, value_parser = clap::value_parser!(u32).range(1..))]
+        max_height: u32,
+        /// JPEG quality for annotated preview.
+        #[arg(long, default_value_t = 82, value_parser = clap::value_parser!(u8).range(1..=100))]
+        quality: u8,
+        /// Annotated preview format. Inferred from extension when omitted.
+        #[arg(long, value_enum)]
+        format: Option<ScreenshotFormat>,
+    },
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -299,6 +325,13 @@ enum ScreenshotFormat {
     Png,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum CoordSpace {
+    Device,
+    Preview,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionState {
     device: String,
@@ -311,7 +344,7 @@ struct SessionStore {
     sessions: BTreeMap<String, SessionState>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ScreenshotResult {
     path: PathBuf,
     format: ScreenshotFormat,
@@ -361,6 +394,14 @@ struct UiNode {
 struct UiDump {
     xml: String,
     nodes: Vec<UiNode>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct UiBounds {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
 }
 
 #[derive(Debug)]
@@ -974,6 +1015,92 @@ fn handle_ui(app: &App, command: UiCommand) -> Result<Response> {
                 error: None,
             })
         }
+        UiCommand::Hit {
+            x,
+            y,
+            coords,
+            annotated,
+            compressed,
+            max_width,
+            max_height,
+            quality,
+            format,
+        } => {
+            let device = app.device()?;
+            let screenshot_format = resolve_screenshot_format(annotated.as_ref(), format);
+            let annotated =
+                annotated.unwrap_or_else(|| default_tap_preview_path(screenshot_format));
+            let screenshot = screenshot(
+                &app.adb,
+                &device,
+                &annotated,
+                screenshot_format,
+                max_width,
+                max_height,
+                quality,
+                false,
+            )?;
+
+            let (preview_x, preview_y, device_x, device_y) = match coords {
+                CoordSpace::Device => {
+                    let preview_x = (x as f64 / screenshot.scale_x).round() as i32;
+                    let preview_y = (y as f64 / screenshot.scale_y).round() as i32;
+                    (preview_x, preview_y, x, y)
+                }
+                CoordSpace::Preview => {
+                    let device_x = (x as f64 * screenshot.scale_x).round() as i32;
+                    let device_y = (y as f64 * screenshot.scale_y).round() as i32;
+                    (x, y, device_x, device_y)
+                }
+            };
+            draw_tap_marker(&annotated, screenshot_format, quality, preview_x, preview_y)?;
+
+            let dump = dump_ui(app, &device, compressed, "/sdcard/window_dump.xml", false)?;
+            let containing_nodes = hit_test_nodes(&dump.nodes, device_x, device_y);
+            let hit_node = containing_nodes.last().cloned();
+
+            Ok(Response {
+                ok: true,
+                action: "ui.hit".to_string(),
+                device: Some(device),
+                exit_code: Some(0),
+                stdout: if let Some(node) = &hit_node {
+                    format!(
+                        "tap preview saved {}; likely hits #{} {}\n",
+                        annotated.display(),
+                        node.index,
+                        first_non_empty(&[
+                            node.text.as_str(),
+                            node.content_desc.as_str(),
+                            node.resource_id.as_str(),
+                            node.class.as_str(),
+                        ])
+                    )
+                } else {
+                    format!(
+                        "tap preview saved {}; no matching UI node at device {},{}\n",
+                        annotated.display(),
+                        device_x,
+                        device_y
+                    )
+                },
+                stderr: String::new(),
+                data: json!({
+                    "input": { "x": x, "y": y, "coords": coords },
+                    "mapped": {
+                        "preview_x": preview_x,
+                        "preview_y": preview_y,
+                        "device_x": device_x,
+                        "device_y": device_y,
+                    },
+                    "annotated_screenshot": screenshot,
+                    "hit_node": hit_node,
+                    "containing_nodes": containing_nodes,
+                    "node_count": dump.nodes.len(),
+                }),
+                error: None,
+            })
+        }
     }
 }
 
@@ -1099,6 +1226,105 @@ fn format_ui_nodes(nodes: &[UiNode]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn hit_test_nodes(nodes: &[UiNode], x: i32, y: i32) -> Vec<UiNode> {
+    let mut hits: Vec<UiNode> = nodes
+        .iter()
+        .filter(|node| {
+            parse_bounds(&node.bounds)
+                .map(|bounds| bounds_contains(bounds, x, y))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    hits.sort_by_key(|node| (node.depth, node.index));
+    hits
+}
+
+fn parse_bounds(bounds: &str) -> Option<UiBounds> {
+    let normalized = bounds.replace("][", ",").replace('[', "").replace(']', "");
+    let parts: Vec<i32> = normalized
+        .split(',')
+        .map(str::trim)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if parts.len() != 4 {
+        return None;
+    }
+    Some(UiBounds {
+        left: parts[0],
+        top: parts[1],
+        right: parts[2],
+        bottom: parts[3],
+    })
+}
+
+fn bounds_contains(bounds: UiBounds, x: i32, y: i32) -> bool {
+    x >= bounds.left && x < bounds.right && y >= bounds.top && y < bounds.bottom
+}
+
+fn draw_tap_marker(
+    path: &PathBuf,
+    format: ScreenshotFormat,
+    quality: u8,
+    x: i32,
+    y: i32,
+) -> Result<()> {
+    let mut image = image::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .to_rgba8();
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    let outer_radius = 18;
+    let inner_radius = 7;
+
+    for dy in -outer_radius..=outer_radius {
+        for dx in -outer_radius..=outer_radius {
+            let px = x + dx;
+            let py = y + dy;
+            if px < 0 || py < 0 || px >= width || py >= height {
+                continue;
+            }
+            let distance_sq = dx * dx + dy * dy;
+            let pixel = if distance_sq <= inner_radius * inner_radius {
+                Some(Rgba([255, 0, 0, 255]))
+            } else if distance_sq <= outer_radius * outer_radius
+                && distance_sq >= (outer_radius - 3) * (outer_radius - 3)
+            {
+                Some(Rgba([255, 0, 0, 255]))
+            } else if distance_sq <= (outer_radius - 5) * (outer_radius - 5)
+                && distance_sq >= (outer_radius - 8) * (outer_radius - 8)
+            {
+                Some(Rgba([255, 255, 255, 255]))
+            } else {
+                None
+            };
+            if let Some(pixel) = pixel {
+                image.put_pixel(px as u32, py as u32, pixel);
+            }
+        }
+    }
+
+    match format {
+        ScreenshotFormat::Jpeg => {
+            let mut file = File::create(path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
+            let mut encoder = JpegEncoder::new_with_quality(&mut file, quality);
+            encoder
+                .encode_image(&image::DynamicImage::ImageRgb8(rgb))
+                .with_context(|| format!("failed to encode JPEG {}", path.display()))?;
+        }
+        ScreenshotFormat::Png => {
+            image::DynamicImage::ImageRgba8(image)
+                .save_with_format(path, ImageFormat::Png)
+                .with_context(|| format!("failed to write PNG {}", path.display()))?;
+        }
+    }
+
+    Ok(())
 }
 
 fn first_non_empty<'a>(values: &[&'a str]) -> &'a str {
@@ -1689,6 +1915,14 @@ fn default_screenshot_path(format: ScreenshotFormat) -> PathBuf {
     PathBuf::from(format!("screenshot-{}.{}", unix_now(), extension))
 }
 
+fn default_tap_preview_path(format: ScreenshotFormat) -> PathBuf {
+    let extension = match format {
+        ScreenshotFormat::Jpeg => "jpg",
+        ScreenshotFormat::Png => "png",
+    };
+    PathBuf::from(format!("tap-preview-{}.{}", unix_now(), extension))
+}
+
 fn read_session_store() -> Result<SessionStore> {
     let path = session_path()?;
     let content =
@@ -1909,5 +2143,56 @@ emulator-5554 device product:sdk_gphone64 model:sdk_gphone64 transport_id:1
         assert_eq!(nodes[1].content_desc, "Settings title");
         assert!(nodes[1].clickable);
         assert!(ui_node_matches(&nodes[1], "settings"));
+    }
+
+    #[test]
+    fn hit_testing_prefers_deepest_node_last() {
+        let nodes = vec![
+            UiNode {
+                index: 0,
+                depth: 1,
+                text: String::new(),
+                content_desc: String::new(),
+                resource_id: "root".to_string(),
+                class: "Frame".to_string(),
+                package: "pkg".to_string(),
+                bounds: "[0,0][100,100]".to_string(),
+                clickable: false,
+                enabled: true,
+                focused: false,
+                selected: false,
+                scrollable: false,
+            },
+            UiNode {
+                index: 1,
+                depth: 2,
+                text: "Button".to_string(),
+                content_desc: String::new(),
+                resource_id: "button".to_string(),
+                class: "Button".to_string(),
+                package: "pkg".to_string(),
+                bounds: "[10,10][50,50]".to_string(),
+                clickable: true,
+                enabled: true,
+                focused: false,
+                selected: false,
+                scrollable: false,
+            },
+        ];
+
+        let hits = hit_test_nodes(&nodes, 25, 25);
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits.last().unwrap().resource_id, "button");
+        assert!(bounds_contains(
+            parse_bounds("[10,10][50,50]").unwrap(),
+            10,
+            10
+        ));
+        assert!(!bounds_contains(
+            parse_bounds("[10,10][50,50]").unwrap(),
+            50,
+            50
+        ));
     }
 }

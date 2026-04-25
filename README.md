@@ -153,6 +153,8 @@ Accessibility/UI hierarchy:
 adb-agent ui tree --output json
 adb-agent ui find "Settings" --output json
 adb-agent ui dump --local window_dump.xml --output json
+adb-agent ui hit 540 1200 --annotated tap-preview.jpg --output json
+adb-agent ui hit 250 550 --coords preview --annotated tap-preview.jpg --output json
 ```
 
 `ui` commands use Android `uiautomator dump` to collect accessibility hierarchy
@@ -160,6 +162,11 @@ metadata. This gives agents indirect screen context such as text,
 `content-desc`, `resource-id`, class, package, bounds, clickable/enabled/focused
 state, and scrollability. It is a reference layer for deciding where to tap or
 what to verify; screenshot remains useful for visual confirmation.
+
+`ui hit` does not tap. It predicts which accessibility node a coordinate would
+hit, saves a screenshot preview with a red marker, and returns both preview and
+device coordinates. Use it before `tap` when an agent needs a visual sanity
+check.
 
 Shell and raw adb:
 
